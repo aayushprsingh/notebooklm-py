@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -22,6 +23,34 @@ from .types import AskResult, ChatReference, ConversationTurn
 logger = logging.getLogger(__name__)
 
 _DEFAULT_BL = "boq_labs-tailwind-frontend_20260301.03_p0"
+
+
+class StreamChunk:
+    """A single chunk yielded by ask_stream().
+
+    Attributes:
+        text: Text content from this chunk (empty if this chunk has no text).
+        is_answer: True if this chunk is part of the main answer stream.
+        reference: A ChatReference if this chunk contains a citation.
+        conversation_id: The server-assigned conversation ID (may appear mid-stream).
+        done: True when all chunks have been delivered.
+    """
+
+    __slots__ = ("conversation_id", "done", "is_answer", "reference", "text")
+
+    def __init__(
+        self,
+        text: str = "",
+        is_answer: bool = False,
+        reference: ChatReference | None = None,
+        conversation_id: str | None = None,
+        done: bool = False,
+    ):
+        self.text = text
+        self.is_answer = is_answer
+        self.reference = reference
+        self.conversation_id = conversation_id
+        self.done = done
 
 # UUID pattern for validating source IDs (compiled once at module level)
 _UUID_PATTERN = re.compile(
@@ -183,6 +212,153 @@ class ChatAPI:
             references=references,
             raw_response=response.text[:1000],
         )
+
+    async def ask_stream(
+        self,
+        notebook_id: str,
+        question: str,
+        source_ids: list[str] | None = None,
+        conversation_id: str | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """Ask the notebook a question, yielding chunks as they arrive.
+
+        This is an async generator that streams the response in real time,
+        yielding StreamChunk objects with named attributes.
+
+        Use this for real-time answer display or progressive reference extraction.
+        If you don't need streaming, use ``ask()`` instead.
+
+        Args:
+            notebook_id: The notebook ID.
+            question: The question to ask.
+            source_ids: Specific source IDs to query. If None, uses all sources.
+            conversation_id: Existing conversation ID for follow-up questions.
+
+        Yields:
+            StreamChunk objects containing text, references, and metadata.
+            - chunk.text: The text content of this chunk (empty if none).
+            - chunk.is_answer: True if this chunk is part of the main answer stream.
+            - chunk.reference: A ChatReference if this chunk contains a citation.
+            - chunk.conversation_id: Server-assigned conversation ID (may appear mid-stream).
+            - chunk.done: True when all chunks have been delivered.
+
+        Example:
+            async for chunk in client.chat.ask_stream(nb_id, "Explain quantum entanglement"):
+                if chunk.text:
+                    print(chunk.text, end="", flush=True)
+                if chunk.reference:
+                    print(f"\\n[cited: {chunk.reference.cited_text[:50]}...]")
+                if chunk.done:
+                    print("\\n--- done ---")
+        """
+        if source_ids is None:
+            source_ids = await self._core.get_source_ids(notebook_id)
+
+        is_new_conversation = conversation_id is None
+        if is_new_conversation:
+            conversation_id = str(uuid.uuid4())
+            conversation_history = None
+        else:
+            conversation_history = self._build_conversation_history(conversation_id)
+
+        sources_array = [[[sid]] for sid in source_ids] if source_ids else []
+
+        params: list[Any] = [
+            sources_array,
+            question,
+            conversation_history,
+            [2, None, [1], [1]],
+            conversation_id,
+            None,
+            None,
+            notebook_id,
+            1,
+        ]
+
+        params_json = json.dumps(params, separators=(",", ":"))
+        f_req = [None, params_json]
+        f_req_json = json.dumps(f_req, separators=(",", ":"))
+
+        encoded_req = quote(f_req_json, safe="")
+
+        body_parts = [f"f.req={encoded_req}"]
+        if self._core.auth.csrf_token:
+            encoded_at = quote(self._core.auth.csrf_token, safe="")
+            body_parts.append(f"at={encoded_at}")
+
+        body = "&".join(body_parts) + "&"
+
+        self._core._reqid_counter += 100000
+        url_params = {
+            "bl": os.environ.get("NOTEBOOKLM_BL", _DEFAULT_BL),
+            "hl": "en",
+            "_reqid": str(self._core._reqid_counter),
+            "rt": "c",
+        }
+        if self._core.auth.session_id:
+            url_params["f.sid"] = self._core.auth.session_id
+
+        query_string = urlencode(url_params)
+        url = f"{QUERY_URL}?{query_string}"
+
+        http_client = self._core.get_http_client()
+        server_conv_id: str | None = None
+        streamed = False
+        accumulated_answer = ""
+        accumulated_refs: list[ChatReference] = []
+
+        try:
+            # Stream the response line-by-line instead of reading all at once
+            async with http_client.stream("POST", url, content=body) as response:
+                response.raise_for_status()
+
+                async for line in response.aiter_lines():
+                    if not line or line.isspace():
+                        continue
+
+                    text, is_answer, refs, conv_id = self._extract_answer_and_refs_from_chunk(line)
+
+                    if conv_id:
+                        server_conv_id = conv_id
+                        yield StreamChunk(conversation_id=conv_id)
+
+                    if text:
+                        streamed = True
+                        accumulated_answer += text
+                        yield StreamChunk(text=text, is_answer=is_answer)
+
+                    if refs:
+                        for ref in refs:
+                            if ref not in accumulated_refs:
+                                accumulated_refs.append(ref)
+                            yield StreamChunk(reference=ref)
+
+                if not streamed:
+                    logger.warning(
+                        "ask_stream: no text received from API for question: %s",
+                        question[:100],
+                    )
+
+                # Cache the conversation turn so follow-up questions work
+                final_conv_id = server_conv_id or conversation_id
+                if accumulated_answer and final_conv_id:
+                    turns = self._core.get_cached_conversation(final_conv_id)
+                    turn_number = len(turns) + 1
+                    self._core.cache_conversation_turn(
+                        final_conv_id, question, accumulated_answer, turn_number
+                    )
+
+                # Final chunk with conversation_id
+                yield StreamChunk(conversation_id=server_conv_id, done=True)
+
+        except httpx.TimeoutException as e:
+            raise NetworkError(f"Chat stream timed out: {e}", original_error=e) from e
+        except httpx.HTTPStatusError as e:
+            raise ChatError(
+                f"Chat stream failed with HTTP {e.response.status_code}: {e}"
+            ) from e
+        except httpx.RequestError as e:
+            raise NetworkError(f"Chat stream failed: {e}", original_error=e) from e
 
     async def get_conversation_turns(
         self, notebook_id: str, conversation_id: str, limit: int = 2

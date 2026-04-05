@@ -41,6 +41,8 @@ except PackageNotFoundError:
     )
 
 # Public API: Authentication
+# Public API: Chat streaming chunk
+from ._chat import StreamChunk  # noqa: PLC0415
 from .auth import AuthTokens
 
 # Public API: Client
@@ -150,6 +152,7 @@ __all__ = [
     "ConversationTurn",
     "ChatReference",
     "AskResult",
+    "StreamChunk",
     "ChatMode",
     "SharedUser",
     "ShareStatus",

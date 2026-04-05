@@ -1,9 +1,9 @@
-"""Artifacts API for NotebookLM studio content.
-
-Provides operations for generating, listing, downloading, and managing
+"""Provides operations for generating, listing, downloading, and managing
 AI-generated artifacts including Audio Overviews, Video Overviews, Reports,
 Quizzes, Flashcards, Infographics, Slide Decks, Data Tables, and Mind Maps.
 """
+
+from __future__ import annotations
 
 import asyncio
 import builtins
@@ -12,6 +12,7 @@ import html
 import json
 import logging
 import re
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -20,7 +21,7 @@ import httpx
 
 from ._core import ClientCore
 from .auth import load_httpx_cookies
-from .exceptions import ValidationError
+from .exceptions import ArtifactError, ValidationError
 from .rpc import (
     ArtifactStatus,
     ArtifactTypeCode,
@@ -227,7 +228,7 @@ class ArtifactsAPI:
     def __init__(
         self,
         core: ClientCore,
-        notes_api: "NotesAPI",
+        notes_api: NotesAPI,
         storage_path: Path | None = None,
     ):
         """Initialize the artifacts API.
@@ -2472,3 +2473,216 @@ class ArtifactsAPI:
                 e,
             )
             return not is_media  # False for media (continue polling), True for non-media
+
+    # =============================================================================
+    # Bulk Operations
+    # =============================================================================
+
+    async def generate_bulk(
+        self,
+        notebook_ids: list[str],
+        generate_fn: Callable[[str], Coroutine[Any, Any, GenerationStatus]],
+        *,
+        max_concurrency: int = 3,
+        error_mode: str = "collect_all",
+    ) -> dict[str, GenerationStatus | Exception]:
+        """Generate an artifact across multiple notebooks concurrently.
+
+        Runs the same generation operation on multiple notebooks at once,
+        useful for batch-creating audio overviews, quizzes, etc.
+
+        Args:
+            notebook_ids: List of notebook IDs to generate artifacts in.
+            generate_fn: Async function to call for each notebook.
+                Receives a single notebook_id as argument.
+                Example: ``lambda nb_id: self.generate_audio(nb_id)``
+            max_concurrency: Maximum simultaneous operations (default 3).
+                Keep this low to avoid rate limits.
+            error_mode: How to handle per-notebook errors.
+                - "collect_all": Collect all errors, process all notebooks (default)
+                - "fail_fast": Stop on first error
+
+        Returns:
+            Dict mapping notebook_id -> GenerationStatus (success) or Exception (failure).
+
+        Example:
+            results = await client.artifacts.generate_bulk(
+                notebook_ids=["nb1", "nb2", "nb3"],
+                generate_fn=lambda nb: client.artifacts.generate_audio(nb),
+                max_concurrency=2,
+            )
+            for nb_id, result in results.items():
+                if isinstance(result, Exception):
+                    print(f"{nb_id}: FAILED — {result}")
+                else:
+                    print(f"{nb_id}: {result.task_id}")
+        """
+        if not notebook_ids:
+            return {}
+
+        if max_concurrency <= 0:
+            raise ValueError(f"max_concurrency must be > 0, got {max_concurrency}")
+
+        total = len(notebook_ids)
+        semaphore = asyncio.Semaphore(max_concurrency)
+        results: dict[str, GenerationStatus | Exception] = {}
+
+        async def _generate_one(nb_id: str) -> None:
+            async with semaphore:
+                try:
+                    status = await generate_fn(nb_id)
+                    results[nb_id] = status
+                except Exception as e:  # noqa: BLE001
+                    if error_mode == "fail_fast":
+                        raise
+                    results[nb_id] = e
+
+        tasks = [asyncio.create_task(_generate_one(nb_id)) for nb_id in notebook_ids]
+        try:
+            await asyncio.gather(*tasks, return_exceptions=error_mode == "collect_all")
+        except Exception:
+            # Cancelling pending tasks in fail_fast mode — prevents orphaned
+            # coroutines from continuing to consume quota after the first failure.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        successful = sum(1 for r in results.values() if isinstance(r, GenerationStatus))
+        logger.info(
+            "Bulk generate complete: %d/%d successful across %d notebooks",
+            successful,
+            total,
+            total,
+        )
+        return results
+
+    async def download_all(
+        self,
+        notebook_id: str,
+        artifact_type: ArtifactType,
+        output_dir: str,
+        *,
+        output_format: str | None = None,
+        max_concurrency: int = 3,
+    ) -> dict[str, str | Exception]:
+        """Download all artifacts of a given type from a notebook.
+
+        Finds all completed artifacts of the specified type and downloads
+        them to the output directory, naming them by artifact title.
+
+        Args:
+            notebook_id: The notebook ID.
+            artifact_type: The type of artifact to download.
+            output_dir: Directory to save downloaded files.
+            output_format: Format for interactive artifacts (quiz/flashcards).
+                Valid values: "json", "markdown", "html". None uses type default.
+            max_concurrency: Max simultaneous downloads (default 3).
+
+        Returns:
+            Dict mapping filename -> path (success) or error message (failure).
+
+        Example:
+            result = await client.artifacts.download_all(
+                "notebook-id",
+                ArtifactType.QUIZ,
+                "./output",
+                output_format="markdown",
+            )
+            for fname, status in result.items():
+                if isinstance(status, Exception):
+                    print(f"FAILED {fname}: {status}")
+        """
+        if max_concurrency <= 0:
+            raise ValueError(f"max_concurrency must be > 0, got {max_concurrency}")
+
+        artifacts = await self.list(notebook_id, artifact_type)
+        completed = [a for a in artifacts if a.is_completed]
+
+        if not completed:
+            raise ArtifactNotReadyError(artifact_type.value)
+
+        # Sort newest first
+        completed.sort(key=lambda a: a.created_at.timestamp() if a.created_at else 0, reverse=True)
+
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+        def _safe_filename(title: str, ext: str, suffix: str = "") -> str:
+            safe = "".join(c if c.isalnum() or c in " -_" else "_" for c in title)
+            return f"{safe[:80]}{suffix}.{ext}"
+
+        extensions = {
+            ArtifactType.AUDIO: "mp4",
+            ArtifactType.VIDEO: "mp4",
+            ArtifactType.INFOGRAPHIC: "png",
+            ArtifactType.SLIDE_DECK: output_format or "pdf",
+            ArtifactType.REPORT: "md",
+            ArtifactType.QUIZ: output_format or "json",
+            ArtifactType.FLASHCARDS: output_format or "json",
+            ArtifactType.DATA_TABLE: "csv",
+            ArtifactType.MIND_MAP: "json",
+        }
+        ext = extensions.get(artifact_type, "bin")
+
+        # Build specs with uniqueness suffixes for collision avoidance
+        name_counts: dict[str, int] = {}
+        specs: list[tuple[str, str]] = []
+        for art in completed:
+            base = _safe_filename(art.title or art.id, ext)
+            name_counts[base] = name_counts.get(base, 0) + 1
+            if name_counts[base] > 1:
+                out_path = str(Path(output_dir) / _safe_filename(art.title or art.id, ext, f"-{name_counts[base] - 1}"))
+            else:
+                out_path = str(Path(output_dir) / base)
+            specs.append((art.id, out_path))
+
+        results: dict[str, str | Exception] = {}
+        semaphore = asyncio.Semaphore(max_concurrency)
+
+        async def _download_one(art_id: str, out_path: str) -> None:
+            async with semaphore:
+                try:
+                    await self._download_by_type(notebook_id, artifact_type, art_id, out_path, output_format)
+                    results[Path(out_path).name] = out_path
+                except Exception as e:  # noqa: BLE001
+                    results[Path(out_path).name] = e
+
+        await asyncio.gather(
+            *[_download_one(aid, op) for aid, op in specs],
+            return_exceptions=True,
+        )
+        return results
+
+    async def _download_by_type(
+        self,
+        notebook_id: str,
+        artifact_type: ArtifactType,
+        artifact_id: str,
+        output_path: str,
+        output_format: str | None,
+    ) -> str:
+        """Route download to the correct typed method."""
+        if artifact_type == ArtifactType.AUDIO:
+            return await self.download_audio(notebook_id, output_path, artifact_id)
+        elif artifact_type == ArtifactType.VIDEO:
+            return await self.download_video(notebook_id, output_path, artifact_id)
+        elif artifact_type == ArtifactType.INFOGRAPHIC:
+            return await self.download_infographic(notebook_id, output_path, artifact_id)
+        elif artifact_type == ArtifactType.SLIDE_DECK:
+            fmt = output_format or "pdf"
+            return await self.download_slide_deck(notebook_id, output_path, artifact_id, fmt)
+        elif artifact_type == ArtifactType.REPORT:
+            return await self.download_report(notebook_id, output_path, artifact_id)
+        elif artifact_type == ArtifactType.QUIZ:
+            fmt = output_format or "json"
+            return await self.download_quiz(notebook_id, output_path, artifact_id, fmt)
+        elif artifact_type == ArtifactType.FLASHCARDS:
+            fmt = output_format or "json"
+            return await self.download_flashcards(notebook_id, output_path, artifact_id, fmt)
+        elif artifact_type == ArtifactType.DATA_TABLE:
+            return await self.download_data_table(notebook_id, output_path, artifact_id)
+        elif artifact_type == ArtifactType.MIND_MAP:
+            return await self.download_mind_map(notebook_id, output_path, artifact_id)
+        else:
+            raise ArtifactError(f"No download method for artifact type: {artifact_type}")
