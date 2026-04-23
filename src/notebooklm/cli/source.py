@@ -165,7 +165,7 @@ def source_list(ctx, notebook_id, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             sources = await client.sources.list(nb_id_resolved)
             nb = None
@@ -230,9 +230,11 @@ def source_list(ctx, notebook_id, json_output, client_auth):
 )
 @click.option("--title", help="Title for text sources")
 @click.option("--mime-type", help="MIME type for file sources")
+@click.option("--timeout", type=float, default=30.0,
+              help="HTTP request timeout in seconds (default: 30). Increase for slow URLs.")
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @with_client
-def source_add(ctx, content, notebook_id, source_type, title, mime_type, json_output, client_auth):
+def source_add(ctx, content, notebook_id, source_type, title, mime_type, json_output, timeout, client_auth):
     """Add a source to a notebook.
 
     \b
@@ -272,7 +274,7 @@ def source_add(ctx, content, notebook_id, source_type, title, mime_type, json_ou
             file_title = title or "Pasted Text"
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             if detected_type == "url" or detected_type == "youtube":
                 src = await client.sources.add_url(nb_id_resolved, content)
@@ -321,7 +323,7 @@ def source_get(ctx, source_id, notebook_id, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             # Resolve partial ID to full ID
             resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
@@ -361,7 +363,7 @@ def source_delete(ctx, source_id, notebook_id, yes, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             resolved_id = await _resolve_source_for_delete(client, nb_id_resolved, source_id)
 
@@ -393,7 +395,7 @@ def source_delete_by_title(ctx, title, notebook_id, yes, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             source = await _resolve_source_by_exact_title(client, nb_id_resolved, title)
 
@@ -428,7 +430,7 @@ def source_rename(ctx, source_id, new_title, notebook_id, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             # Resolve partial ID to full ID
             resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
@@ -457,7 +459,7 @@ def source_refresh(ctx, source_id, notebook_id, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             # Resolve partial ID to full ID
             resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
@@ -506,7 +508,7 @@ def source_add_drive(ctx, file_id, title, notebook_id, mime_type, client_auth):
     mime = mime_map[mime_type]
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             with console.status("Adding Drive source..."):
                 src = await client.sources.add_drive(nb_id_resolved, file_id, title, mime)
@@ -562,7 +564,7 @@ def source_add_research(
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             console.print(f"[yellow]Starting {mode} research on {search_source}...[/yellow]")
             result = await client.research.start(nb_id_resolved, query, search_source, mode)
@@ -643,7 +645,7 @@ def source_fulltext(ctx, source_id, notebook_id, json_output, output, client_aut
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
 
@@ -707,7 +709,7 @@ def source_guide(ctx, source_id, notebook_id, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
 
@@ -767,7 +769,7 @@ def source_stale(ctx, source_id, notebook_id, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
             is_fresh = await client.sources.check_freshness(nb_id_resolved, resolved_id)
@@ -832,7 +834,7 @@ def source_wait(ctx, source_id, notebook_id, timeout, json_output, client_auth):
     nb_id = require_notebook(notebook_id)
 
     async def _run():
-        async with NotebookLMClient(client_auth) as client:
+        async with NotebookLMClient(client_auth, timeout=timeout) as client:
             nb_id_resolved = await resolve_notebook_id(client, nb_id)
             resolved_id = await resolve_source_id(client, nb_id_resolved, source_id)
 
